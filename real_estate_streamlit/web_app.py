@@ -9,6 +9,7 @@ from location_catalog import LOCATION_OPTIONS
 
 st.set_page_config(page_title='Hungarian Housing Intelligence', page_icon='🏙️', layout='wide')
 DATA_PATH = Path(__file__).resolve().parent / 'data' / 'housing_prices.csv'
+FX_PATH = Path(__file__).resolve().parent / 'data' / 'eur_huf_history.csv'
 LABELS = {v: k for k, v in LOCATION_OPTIONS.items()}
 
 @st.cache_data(show_spinner=False)
@@ -26,6 +27,22 @@ def read_data(path, modified):
     df['location'] = df['location'].astype(str)
     df['city'] = df['location'].map(LABELS).fillna(df['location'])
     return df.sort_values('snapshot_date')
+
+
+
+@st.cache_data(show_spinner=False)
+def read_fx_data(path, modified):
+    fx = pd.read_csv(path)
+    required = {'snapshot_date', 'eur_huf'}
+    if required - set(fx.columns):
+        raise ValueError('Missing FX CSV columns: ' + ', '.join(sorted(required - set(fx.columns))))
+    fx['snapshot_date'] = pd.to_datetime(fx['snapshot_date'], errors='coerce')
+    fx['eur_huf'] = pd.to_numeric(fx['eur_huf'], errors='coerce')
+    fx = fx.dropna(subset=['snapshot_date', 'eur_huf'])
+    fx = fx[fx['eur_huf'] > 0]
+    return (fx.sort_values('snapshot_date')
+            .drop_duplicates('snapshot_date', keep='last')
+            [['snapshot_date', 'eur_huf']])
 
 
 def fmt_huf(x):
@@ -97,7 +114,7 @@ m2.metric('Időszaki változás', f'{change:+.1f}%' if pd.notna(change) else '�
 m3.metric('Utolsó mintaszám', f'{last.sample_count:,.0f}' if pd.notna(last.sample_count) else 'n.a.')
 m4.metric('Adat utolsó napja', str(last.snapshot_date.date()))
 
-tab1,tab2,tab3,tab4 = st.tabs(['📈 Idősor', '🕯️ Technikai grafikon', '🏘️ Lokációk', '📥 Adatok és módszertan'])
+tab1,tab2,tab3,tab4,tab5 = st.tabs(['📈 Idősor', '🕯️ Technikai grafikon', '💶 EUR/HUF összevetés', '🏘️ Lokációk', '📋 Adatok és módszertan'])
 with tab1:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=city.snapshot_date, y=city.huf_per_sqm, mode='lines+markers', name=LABELS.get(selected,selected), line=dict(width=3)))
@@ -107,7 +124,7 @@ with tab1:
         if not old.empty and not new.empty:
             fig.add_shape(type='line', x0=new.snapshot_date.min(), x1=new.snapshot_date.min(), y0=0, y1=1, yref='paper', line=dict(dash='dash', color='orange'))
     fig.update_layout(yaxis_title='Ft/m²', xaxis_title='Dátum', hovermode='x unified', height=460)
-    st.plotly_chart(fig, width='stretch')
+    st.plotly_chart(fig, width='stretch', config={'modeBarButtonsToRemove': ['toImage']})
     st.caption('Debrecennél a korábbi historikus sorozat az új 47loc sorozat kezdetéig szerepel; az átfedő időpontokat az exportáló levágja.')
 
 with tab2:
@@ -138,11 +155,62 @@ with tab2:
         fig.add_trace(go.Scatter(x=tech.index,y=tech.MACD,name='MACD'),row=row,col=1)
         fig.add_trace(go.Scatter(x=tech.index,y=tech.Signal,name='Signal'),row=row,col=1)
     fig.update_layout(height=650 if rows>1 else 490, xaxis_rangeslider_visible=False, legend=dict(orientation='h'))
-    st.plotly_chart(fig, width='stretch')
+    st.plotly_chart(fig, width='stretch', config={'modeBarButtonsToRemove': ['toImage']})
     if len(tech)<20:
         st.caption('Kevés heti adat esetén egyes indikátorok szándékosan hiányosak.')
 
 with tab3:
+    st.subheader('EUR/HUF árfolyam és lakásár-index')
+    st.caption('A régi debreceni MySQL-adatsorból számított historikus EUR/HUF árfolyam. Nem élő devizaadat; a későbbi időszakokra nem feltétlenül van árfolyam-megfigyelés.')
+    if not FX_PATH.exists():
+        st.warning('Hiányzik a data/eur_huf_history.csv. Futtasd újra a frissített export_mysql_snapshot.py szkriptet a saját gépeden, majd töltsd fel a CSV-t.')
+    else:
+        try:
+            fx_data = read_fx_data(str(FX_PATH), FX_PATH.stat().st_mtime_ns)
+        except Exception as exc:
+            st.error(f'Nem sikerült beolvasni az EUR/HUF adatokat: {exc}')
+            fx_data = pd.DataFrame(columns=['snapshot_date', 'eur_huf'])
+        fx_window = fx_data[(fx_data['snapshot_date'].dt.date >= begin) &
+                            (fx_data['snapshot_date'].dt.date <= end)]
+        if fx_window.empty:
+            st.info('A kiválasztott időszakban nincs historikus EUR/HUF-adat. Próbálj korábbi dátumot választani az oldalsávban.')
+        else:
+            mode = st.radio('Összehasonlítás típusa',
+                            ['Két tengely (Ft/m² és Ft/EUR)', 'Bázisindex (első közös megfigyelés = 100)'],
+                            horizontal=True)
+            # Az árindex napjaihoz a legutóbbi, nem későbbi FX-megfigyelést párosítjuk.
+            # Nem engedünk 7 napnál régebbi árfolyamot, hogy ne tűnjön élő adatnak.
+            paired = pd.merge_asof(
+                city[['snapshot_date', 'huf_per_sqm']].sort_values('snapshot_date'),
+                fx_window[['snapshot_date', 'eur_huf']].sort_values('snapshot_date'),
+                on='snapshot_date', direction='backward', tolerance=pd.Timedelta(days=7)
+            ).dropna(subset=['eur_huf'])
+            if paired.empty:
+                st.warning('Nincs közös, legfeljebb 7 nap eltérésű árfolyam- és lakásár-megfigyelés az adott városnál és időszakban.')
+            else:
+                fx_fig = make_subplots(specs=[[{'secondary_y': True}]])
+                label = LABELS.get(selected, selected)
+                if mode.startswith('Bázisindex'):
+                    price_series = paired['huf_per_sqm'] / paired['huf_per_sqm'].iloc[0] * 100
+                    fx_series = paired['eur_huf'] / paired['eur_huf'].iloc[0] * 100
+                    fx_fig.add_trace(go.Scatter(x=paired.snapshot_date, y=price_series,
+                        mode='lines', name=f'{label} lakásár-index'), secondary_y=False)
+                    fx_fig.add_trace(go.Scatter(x=paired.snapshot_date, y=fx_series,
+                        mode='lines', name='EUR/HUF (bázisindex)'), secondary_y=False)
+                    fx_fig.update_yaxes(title_text='Bázisindex (100 = első közös adat)', secondary_y=False)
+                else:
+                    fx_fig.add_trace(go.Scatter(x=city.snapshot_date, y=city.huf_per_sqm,
+                        mode='lines', name=f'{label} · Ft/m²'), secondary_y=False)
+                    fx_fig.add_trace(go.Scatter(x=fx_window.snapshot_date, y=fx_window.eur_huf,
+                        mode='lines', name='EUR/HUF · Ft/EUR'), secondary_y=True)
+                    fx_fig.update_yaxes(title_text='Lakásár-index (Ft/m²)', secondary_y=False)
+                    fx_fig.update_yaxes(title_text='EUR/HUF (Ft/EUR)', secondary_y=True)
+                fx_fig.update_layout(height=510, hovermode='x unified',
+                    legend=dict(orientation='h', y=1.1), margin=dict(t=75))
+                st.plotly_chart(fx_fig, width='stretch', config={'modeBarButtonsToRemove': ['toImage']})
+                st.caption(f'Párosított árindex-megfigyelések: {len(paired)}. Az EUR/HUF a historikus forrásból származik; az ábrázolt lakásár-adatok dátumához legfeljebb 7 nappal korábbi árfolyamot párosítunk.')
+
+with tab4:
     latest = filtered.sort_values('snapshot_date').groupby('location',as_index=False).tail(1).copy()
     latest['Város'] = latest['city']
     latest['Ár (Ft/m²)'] = latest['huf_per_sqm'].round().astype(int)
@@ -153,13 +221,11 @@ with tab3:
     top = latest.nlargest(20,'huf_per_sqm').sort_values('huf_per_sqm')
     bar = go.Figure(go.Bar(x=top.huf_per_sqm, y=top.city, orientation='h'))
     bar.update_layout(height=640, xaxis_title='Ft/m²', yaxis_title='')
-    st.plotly_chart(bar,width='stretch')
+    st.plotly_chart(bar,width='stretch',config={'modeBarButtonsToRemove': ['toImage']})
 
-with tab4:
+with tab5:
     st.write(f'**Megfigyelések:** {len(filtered):,} · **Lokációk adattal:** {filtered.location.nunique()}')
     st.dataframe(city[['snapshot_date','huf_per_sqm','source','sample_count']].sort_values('snapshot_date',ascending=False),hide_index=True,width='stretch')
-    st.download_button('⬇️ Kiválasztott város CSV',city[['snapshot_date','location','huf_per_sqm','sample_count','source']].to_csv(index=False).encode('utf-8-sig'),file_name=f'{selected.replace("/","_")}.csv',mime='text/csv')
-    st.download_button('⬇️ Szűrt teljes CSV',filtered[['snapshot_date','location','huf_per_sqm','sample_count','source']].to_csv(index=False).encode('utf-8-sig'),file_name='housing_prices_filtered.csv',mime='text/csv')
     st.markdown('**Módszertan:** 50–60 m²-es eladó lakások Jófogás-hirdetései; lokációnkénti Ft/m² index, a scraper logikája szerint alsó 10% levágása utáni medián. A mintaszám a levágás utáni elemszám. Ez nem reprezentatív tranzakciós árstatisztika. A historikus Debrecen sorozat külön forráslogika miatt összehasonlíthatósági törést tartalmazhat. A 47 lokáció a célzott lefedettség, nem garantáltan mindegyikhez érkezik érvényes adat.')
 
 st.divider()
